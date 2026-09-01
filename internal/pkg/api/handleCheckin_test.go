@@ -1859,3 +1859,59 @@ func TestProcessPolicyRemoteESServiceTokenSecretPaths(t *testing.T) {
 	assert.False(t, hasServiceToken, "service_token should be deleted by Prepare before delivery to agents")
 	assert.Equal(t, policy.OutputTypeElasticsearch, remotePolicy["type"])
 }
+
+func TestRetryProcessPolicy(t *testing.T) {
+	logger := testlog.SetLogger(t)
+	sentinel := &Action{Id: "test-action"}
+
+	t.Run("succeeds on first attempt", func(t *testing.T) {
+		calls := 0
+		got, err := retryProcessPolicy(t.Context(), logger, 3, 0, func() (*Action, error) {
+			calls++
+			return sentinel, nil
+		})
+		require.NoError(t, err)
+		require.Equal(t, sentinel, got)
+		require.Equal(t, 1, calls)
+	})
+
+	t.Run("retries and succeeds on third attempt", func(t *testing.T) {
+		calls := 0
+		got, err := retryProcessPolicy(t.Context(), logger, 3, 0, func() (*Action, error) {
+			calls++
+			if calls < 3 {
+				return nil, errors.New("transient")
+			}
+			return sentinel, nil
+		})
+		require.NoError(t, err)
+		require.Equal(t, sentinel, got)
+		require.Equal(t, 3, calls)
+	})
+
+	t.Run("returns error after all attempts exhausted", func(t *testing.T) {
+		transientErr := errors.New("persistent ES error")
+		calls := 0
+		got, err := retryProcessPolicy(t.Context(), logger, 3, 0, func() (*Action, error) {
+			calls++
+			return nil, transientErr
+		})
+		require.ErrorIs(t, err, transientErr)
+		require.Nil(t, got)
+		require.Equal(t, 3, calls)
+	})
+
+	t.Run("aborts after first attempt when context is already cancelled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		calls := 0
+		got, err := retryProcessPolicy(ctx, logger, 3, time.Millisecond, func() (*Action, error) {
+			calls++
+			return nil, errors.New("transient")
+		})
+		require.Error(t, err)
+		require.Nil(t, got)
+		// First attempt always runs; sleep before attempt 2 detects cancelled ctx.
+		require.Equal(t, 1, calls)
+	})
+}

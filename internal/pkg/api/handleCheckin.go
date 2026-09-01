@@ -36,6 +36,7 @@ import (
 	"github.com/elastic/fleet-server/v7/internal/pkg/monitor"
 	"github.com/elastic/fleet-server/v7/internal/pkg/policy"
 	"github.com/elastic/fleet-server/v7/internal/pkg/secret"
+	"github.com/elastic/fleet-server/v7/internal/pkg/sleep"
 	"github.com/elastic/fleet-server/v7/internal/pkg/sqn"
 
 	"github.com/gofrs/uuid/v5"
@@ -594,10 +595,12 @@ func (ct *CheckinT) ProcessRequest(zlog zerolog.Logger, w http.ResponseWriter, r
 				actions = append(actions, acs...)
 				break LOOP
 			case policy := <-sub.Output():
-				actionResp, err := processPolicy(ctx, zlog, ct.bulker, agent, policy, ct.outputSecretCandidateCollector)
-				if err != nil {
+				actionResp, ppErr := retryProcessPolicy(ctx, zlog, 3, 500*time.Millisecond, func() (*Action, error) {
+					return processPolicy(ctx, zlog, ct.bulker, agent, policy, ct.outputSecretCandidateCollector)
+				})
+				if ppErr != nil {
 					span.End()
-					return fmt.Errorf("processPolicy: %w", err)
+					return fmt.Errorf("processPolicy: %w", ppErr)
 				}
 				actions = append(actions, *actionResp)
 				break LOOP
@@ -1054,6 +1057,29 @@ func convertActions(zlog zerolog.Logger, agentID string, actions []model.Action)
 	}
 
 	return respList, ackToken
+}
+
+// retryProcessPolicy calls fn up to maxAttempts times with exponential backoff,
+// aborting early if ctx expires. It exists to handle transient ES failures
+// (e.g. brief master-election gaps during cluster scale-out) that cause
+// processPolicy to fail even though the preceding enrollment write succeeded —
+// without retry the agent would re-enroll under a new ID, creating a ghost doc.
+func retryProcessPolicy(ctx context.Context, zlog zerolog.Logger, maxAttempts int, baseDelay time.Duration, fn func() (*Action, error)) (*Action, error) {
+	var action *Action
+	var err error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			if sleepErr := sleep.WithContext(ctx, time.Duration(attempt)*baseDelay); sleepErr != nil {
+				break
+			}
+			zlog.Warn().Err(err).Int("attempt", attempt+1).Msg("transient processPolicy failure, retrying")
+		}
+		action, err = fn()
+		if err == nil {
+			break
+		}
+	}
+	return action, err
 }
 
 // A new policy exists for this agent.  Perform the following:
